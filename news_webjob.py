@@ -353,7 +353,19 @@ def run(topics=None, request_limit=REQUEST_LIMIT_PER_TOPIC) -> pd.DataFrame:
 
     all_articles: list[Article] = []
     for topic in topics:
-        all_articles.extend(fetch_articles_for_topic(client, model, topic, request_limit))
+        topic_articles = fetch_articles_for_topic(client, model, topic, request_limit)
+        if topic_articles:
+            all_articles.extend(topic_articles)
+        else:
+            # No same-day, verified articles for this topic today — add a
+            # placeholder row so the table shows every topic was checked,
+            # rather than silently omitting it.
+            all_articles.append(Article(
+                topic=topic,
+                header="N/A",
+                news="No verified same-day articles found for this topic today.",
+                source_link="N/A",
+            ))
 
     df = pd.DataFrame([
         {"Topic": a.topic, "Header": a.header, "News": a.news, "Source Link": a.source_link}
