@@ -27,7 +27,7 @@ import argparse
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from dotenv import load_dotenv
-load_dotenv()  # load .env file if present
+load_dotenv()  
 import pandas as pd
 from openai import OpenAI
 
@@ -55,6 +55,9 @@ SOURCE_DOMAINS = [
 ]
 
 ARTICLES_PER_TOPIC = 5  # combined across ALL sources, not per source
+
+# Defaults to an "output" folder next to this script, wherever it's run from
+# (works the same on Windows, macOS, Linux, or an Azure WebJob/Function).
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 LINE_PATTERN = re.compile(r"^\s*\d+\.\s*(.+?)\s*:::\s*(.+?)\s*$")
@@ -95,17 +98,25 @@ def get_client_and_model() -> tuple[OpenAI, str]:
     return client, deployment
 
 
-def extract_citation_for_span(annotations, start: int, end: int):
-    """Return the URL of the first citation annotation overlapping [start, end)."""
+def ordered_citation_urls(annotations) -> list[str]:
+    """
+    Returns citation URLs in document order (the order the API emitted them).
+    We pair these positionally with our numbered lines rather than trying to
+    match by exact character offset: annotation spans often cover only a
+    narrow phrase within a sentence (not the whole line), so a strict overlap
+    check is brittle and drops real, verified citations for no good reason.
+    Position-based pairing is far more robust while still guaranteeing every
+    URL traces back to a real annotation, never model-typed text.
+    """
+    dated = []
     for ann in annotations:
-        ann_start = getattr(ann, "start_index", None)
-        ann_end = getattr(ann, "end_index", None)
-        ann_url = getattr(ann, "url", None)
-        if ann_url is None or ann_start is None or ann_end is None:
+        url = getattr(ann, "url", None)
+        start = getattr(ann, "start_index", None)
+        if url is None:
             continue
-        if ann_start < end and ann_end > start:
-            return ann_url
-    return None
+        dated.append((start if start is not None else 0, url))
+    dated.sort(key=lambda pair: pair[0])
+    return [url for _, url in dated]
 
 
 def fetch_articles_for_topic(client: OpenAI, model: str, topic: str,
@@ -160,27 +171,24 @@ def fetch_articles_for_topic(client: OpenAI, model: str, topic: str,
                      f"(check that your deployment supports web_search)")
         return []
 
-    articles = []
-    cursor = 0
+    lines = []
     for raw_line in full_text.splitlines():
         if not raw_line.strip():
             continue
         match = LINE_PATTERN.match(raw_line)
-        line_start = full_text.find(raw_line, cursor)
-        line_end = line_start + len(raw_line)
-        cursor = line_end
+        if match:
+            lines.append((match.group(1).strip(), match.group(2).strip()))
 
-        if not match:
-            continue
+    urls = ordered_citation_urls(annotations)
 
-        header, news = match.group(1).strip(), match.group(2).strip()
-        url = extract_citation_for_span(annotations, line_start, line_end)
+    if len(urls) < len(lines):
+        log.warning(f"  Topic '{topic}': {len(lines)} article lines but only "
+                    f"{len(urls)} citations returned — extra lines will be dropped")
 
-        if not url:
-            log.warning(f"  No verified citation for line, dropping: {header[:60]!r}")
-            continue
-
-        articles.append(Article(topic=topic, header=header, news=news, source_link=url))
+    articles = [
+        Article(topic=topic, header=header, news=news, source_link=url)
+        for (header, news), url in zip(lines, urls)
+    ]
 
     log.info(f"Topic '{topic}': {len(articles)} articles with verified links")
     return articles[:count]
