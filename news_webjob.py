@@ -1,31 +1,10 @@
 """
-news_agent.py
-
-Pulls TODAY'S news articles per topic (combined across all sources) using
-the AZURE OpenAI Responses API's built-in web_search tool, with the search
-scoped to your source domains via the API's native `allowed_domains` filter
-(not a "site:" prompt hack). Source URLs are pulled directly from the
-response's citation annotations (url_citation), never from model-typed text.
-
-No fixed article count per topic — this is a daily digest, so a topic gets
-however many genuinely same-day, verified articles exist (including zero).
-
-Output columns: Topic | Header | News | Source Link
-
-Same-day filter: the web_search tool has no reliable "published date" field, and
-Azure's grounding is index-based (not live), so we can't trust the model's own
-claim of freshness. Instead, after getting a verified URL from a citation, we
-fetch that page directly and read its actual publish-date metadata, then keep
-only articles published on the same calendar date the script is run.
-
-Requirements:
-    pip install openai requests beautifulsoup4
+Install the required packages from requriements.txt before running this script.
 
 Environment variables required:
     AZURE_OPENAI_ENDPOINT     e.g. https://YOUR-RESOURCE-NAME.openai.azure.com/openai/v1/
     AZURE_OPENAI_API_KEY      your Azure OpenAI resource API key
     AZURE_OPENAI_DEPLOYMENT_NAME   the deployment name you gave your model in Azure
-                              (must be GPT-4 class or later; e.g. gpt-4o, gpt-4.1, gpt-5.5)
 """
 
 import os
@@ -34,15 +13,15 @@ import sys
 import json
 import time
 import logging
-import argparse
-from datetime import datetime, timezone, date
-from dataclasses import dataclass
-from dotenv import load_dotenv
-load_dotenv()
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from openai import OpenAI
+from datetime import datetime, timezone, date
+from dataclasses import dataclass
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -389,16 +368,8 @@ def save_output(df: pd.DataFrame, output_dir: str = OUTPUT_DIR) -> tuple[str, st
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pull today's topic-tagged news articles into a table.")
-    parser.add_argument("--request-limit", type=int, default=REQUEST_LIMIT_PER_TOPIC,
-                         help="Upper bound on articles requested per topic (default: 15). "
-                              "Not a cap on final results — all same-day verified articles are kept.")
-    parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR,
-                         help="Directory to save CSV/Excel output")
-    args = parser.parse_args()
-
     log.info("Starting news pull...")
-    df = run(request_limit=args.request_limit)
+    df = run()
 
     if df.empty:
         log.warning("No articles were retrieved. Nothing to save.")
@@ -407,7 +378,7 @@ def main():
     log.info(f"\nTotal articles retrieved: {len(df)}\n")
     print(df.to_string(index=False, max_colwidth=60))
 
-    save_output(df, args.output_dir)
+    save_output(df)
     log.info("Done.")
 
 
