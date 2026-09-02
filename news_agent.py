@@ -2,6 +2,7 @@ from agno.agent import Agent
 from agno.models.openai import OpenResponses
 
 import os
+import asyncio
 import re
 import sys
 import json
@@ -12,6 +13,7 @@ import cloudscraper
 import textwrap
 import pandas as pd
 from tabulate import tabulate
+from pydantic import BaseModel
 from typing import List
 from bs4 import BeautifulSoup
 from openai import OpenAI
@@ -49,7 +51,7 @@ SOURCE_DOMAINS = [
 # that survives the date-verification step is kept; some topics may end up
 # with 0 rows on a slow news day, others with more than this number if the
 # model's search + our verification both agree there's more real coverage.
-REQUEST_LIMIT_PER_TOPIC = 15
+REQUEST_LIMIT_PER_TOPIC = 7
 
 # How many days off from "today" a publish date is still allowed to be.
 # 0 = must be published on the exact same calendar date as the run.
@@ -61,7 +63,7 @@ DATE_TOLERANCE_DAYS = 0
 # the whole point of this filter is a hard same-day guarantee.
 KEEP_UNDATED_ARTICLES = False
 
-MAX_RETRIES_PER_TOPIC = 2  # retries if a call comes back with zero citations
+MAX_RETRIES_PER_TOPIC = 0  # retries if a call comes back with zero citations
 REQUEST_TIMEOUT_SECS = 10
 PAGE_FETCH_DELAY_SECS = 0.5  # be polite between page fetches
 USER_AGENT = (
@@ -98,8 +100,7 @@ class Article:
     news: str
     source_link: str
 
-@dataclass
-class DailyDigest:
+class DailyDigest(BaseModel):
     items: List[Article]
 
 LINE_PATTERN = re.compile(r"^\s*\d+\.\s*(.+?)\s*:::\s*(.+?)\s*$")
@@ -239,12 +240,12 @@ def fetch_articles_for_topic(client: OpenAI, model: str, topic: str,
     """
     today_str = date.today().isoformat()
     prompt = (
-        f"Today's date is {today_str}. Find ALL news articles (combined across "
-        f"all allowed sources) published TODAY, {today_str}, about the topic: "
+        f"Today's date is {today_str}."
+        f"Find the most relevant news articles published TODAY, {today_str}, about the topic, across the allowed sources."
         f"\"{topic}\" — up to a maximum of {request_limit}. Do not include older "
         f"articles even if they are relevant — only today's news. If there are "
         f"none published today, that's fine — just return an empty list.\n"
-        f"If a result is from reuters.com, prefer articles from its "
+        f"From the allowed sources, always prioritize articles from the Middle East section of Reuters "
         f"Middle East section (reuters.com/world/middle-east).\n\n"
         f"You must use the web_search tool to find real articles — do not answer "
         f"from memory. Every line below must be grounded in an actual search result.\n\n"
@@ -277,6 +278,42 @@ def fetch_articles_for_topic(client: OpenAI, model: str, topic: str,
 
         full_text = ""
         annotations = []
+        for item in getattr(response, "output", []):
+            if getattr(item, "type", None) != "web_search_call":
+                continue
+
+            action = getattr(item, "action", None)
+
+            if not action:
+                continue
+
+            action_type = getattr(action, "type", None)
+
+            if action_type == "search":
+                queries = getattr(action, "queries", None) or []
+
+                log.info(
+                    f"[{topic}] Web search queries: {len(queries)}"
+                )
+
+                for i, query in enumerate(queries, 1):
+                    log.info(
+                        f"[{topic}] Query {i}: {query}"
+                    )
+
+            elif action_type == "open_page":
+                log.info(
+                    f"[{topic}] Opened page: "
+                    f"{getattr(action, 'url', None)}"
+                )
+
+            elif action_type == "find_in_page":
+                log.info(
+                    f"[{topic}] Find-in-page: "
+                    f"{getattr(action, 'pattern', None)} "
+                    f"on {getattr(action, 'url', None)}"
+                )
+
         for item in getattr(response, "output", []):
             if getattr(item, "type", None) != "message":
                 continue
@@ -345,12 +382,14 @@ agent = Agent(
     model=OpenResponses(
             id= os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             base_url= os.getenv("AZURE_OPENAI_ENDPOINT"), 
-            api_key= os.getenv("AZURE_OPENAI_API_KEY")
+            api_key= os.getenv("AZURE_OPENAI_API_KEY"),
+            parallel_tool_calls=True,
         ),
     tools=[get_verified_articles],
     output_schema=DailyDigest,
     instructions=(
         "For each topic given, call get_verified_articles exactly once. "
+        "Call get_verified_articles for all topics in parallel whenever possible. "
         "For each article the tool returns, add one item copying header, news, and "
         "source_link EXACTLY as given — character-for-character, no markdown, no added "
         "links, no reformatting. If the tool returns an empty list for a topic, add one "
@@ -358,26 +397,21 @@ agent = Agent(
     ),
 )
 
-response = agent.run(f"Topics: {', '.join(TOPICS)}")
-digest: DailyDigest = response.content   # validated Pydantic object, not a string
-
 _CITATION_JUNK = re.compile(r'\s*\(\[[^\]]*\]\(https?://\S+?\)\)')
 
 def clean_text(s: str) -> str:
     return _CITATION_JUNK.sub('', s).strip()
 
-rows = [
-    {
-        "topic": item.topic,
-        "header": clean_text(item.header),
-        "news": clean_text(item.news),
-        "source_link": item.source_link,
-    }
-    for item in digest.items
-]
-
-df = pd.DataFrame(rows)
-
+def clean_rows(digest: DailyDigest):
+    return [
+        {
+            "topic": item.topic,
+            "header": clean_text(item.header),
+            "news": clean_text(item.news),
+            "source_link": item.source_link,
+        }
+        for item in digest.items
+    ]
 def print_clean_table(df: pd.DataFrame, width: int = 50):
     wrapped = df.copy()
     for col in wrapped.columns:
@@ -386,4 +420,15 @@ def print_clean_table(df: pd.DataFrame, width: int = 50):
         wrapped[col] = wrapped[col].apply(lambda x: "\n".join(textwrap.wrap(str(x), width)) or str(x))
     print(tabulate(wrapped, headers="keys", tablefmt="grid", showindex=False))
 
-print_clean_table(df)
+async def main():
+    start = time.perf_counter()
+    response = await agent.arun(f"Topics: {', '.join(TOPICS)}")
+    digest: DailyDigest = response.content   
+    rows = clean_rows(digest)
+    df = pd.DataFrame(rows)
+    print_clean_table(df)
+    latency = time.perf_counter() - start
+    print(f"Latency: {latency:.3f}s")
+
+if __name__ == "__main__":
+    asyncio.run(main())
