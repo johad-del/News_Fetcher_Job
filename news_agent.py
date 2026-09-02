@@ -8,9 +8,14 @@ import json
 import time
 import logging
 import requests
+import cloudscraper
+import textwrap
+import pandas as pd
+from tabulate import tabulate
+from typing import List
 from bs4 import BeautifulSoup
 from openai import OpenAI
-from datetime import datetime, timezone, date
+from datetime import datetime, date
 from dataclasses import dataclass
 from dotenv import load_dotenv
 load_dotenv()
@@ -64,12 +69,38 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+_scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
+
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.google.com/",
+}
+
+DATE_META_CANDIDATES = [
+    {"property": "article:published_time"},
+    {"property": "og:article:published_time"},
+    {"name": "pubdate"},
+    {"name": "publishdate"},
+    {"name": "publish-date"},
+    {"name": "date"},
+    {"itemprop": "datePublished"},
+    {"name": "sailthru.date"},
+]
+
 @dataclass
 class Article:
     topic: str
     header: str
     news: str
     source_link: str
+
+@dataclass
+class DailyDigest:
+    items: List[Article]
 
 LINE_PATTERN = re.compile(r"^\s*\d+\.\s*(.+?)\s*:::\s*(.+?)\s*$")
 
@@ -122,19 +153,6 @@ def ordered_citation_urls(annotations) -> list[str]:
     dated.sort(key=lambda pair: pair[0])
     return [url for _, url in dated]
 
-
-DATE_META_CANDIDATES = [
-    {"property": "article:published_time"},
-    {"property": "og:article:published_time"},
-    {"name": "pubdate"},
-    {"name": "publishdate"},
-    {"name": "publish-date"},
-    {"name": "date"},
-    {"itemprop": "datePublished"},
-    {"name": "sailthru.date"},
-]
-
-
 def _parse_iso_date(text: str) -> date | None:
     """Best-effort parse of common ISO-ish date/datetime strings to a date."""
     if not text:
@@ -178,30 +196,32 @@ def get_published_date(url: str) -> date | None:
     can't be fetched or no date can be found — callers decide how to treat that.
     """
     try:
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT_SECS)
-        if not resp.ok:
-            log.warning(f"    Date check: HTTP {resp.status_code} fetching {url}")
-            return None
-        soup = BeautifulSoup(resp.text, "html.parser")
+        resp = _scraper.get(url, headers=BROWSER_HEADERS, timeout=REQUEST_TIMEOUT_SECS)
+    except requests.RequestException as e:
+        log.warning(f"    Date check: fetch error for {url} ({e})")
+        return None
 
-        for attrs in DATE_META_CANDIDATES:
-            tag = soup.find("meta", attrs=attrs)
-            if tag and tag.get("content"):
-                parsed = _parse_iso_date(tag["content"])
-                if parsed:
-                    return parsed
+    if resp.status_code == 403:
+        log.warning(f"    Date check: BLOCKED (403 — bot protection) for {url}")
+        return None
+    if not resp.ok:
+        log.warning(f"    Date check: HTTP {resp.status_code} for {url}")
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-        time_tag = soup.find("time", attrs={"datetime": True})
-        if time_tag:
-            parsed = _parse_iso_date(time_tag["datetime"])
+    for attrs in DATE_META_CANDIDATES:
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            parsed = _parse_iso_date(tag["content"])
             if parsed:
                 return parsed
+    time_tag = soup.find("time", attrs={"datetime": True})
+    if time_tag:
+        parsed = _parse_iso_date(time_tag["datetime"])
+        if parsed:
+            return parsed
 
-        return _search_json_ld_for_date(soup)
-
-    except requests.RequestException as e:
-        log.warning(f"    Date check: could not fetch {url} ({e})")
-        return None
+    return _search_json_ld_for_date(soup)
 
 
 def fetch_articles_for_topic(client: OpenAI, model: str, topic: str,
@@ -317,29 +337,53 @@ def fetch_articles_for_topic(client: OpenAI, model: str, topic: str,
 client, model = get_client_and_model()
 
 def get_verified_articles(topic: str) -> list[dict]:
-    """Finds same-day, citation-verified news articles for a topic from
-    reuters.com, thenationalnews.com, and arabnews.com. Returns a list of
-    dicts with header, news, source_link — empty list if none found today."""
-    articles = fetch_articles_for_topic(client,model,topic)
+    """Finds same-day, citation-verified news articles for a topic."""
+    articles = fetch_articles_for_topic(client, model, topic)
     return [{"header": a.header, "news": a.news, "source_link": a.source_link} for a in articles]
 
 agent = Agent(
     model=OpenResponses(
-        id=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
-        base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-    ),
-    name = "News Agent",
+            id= os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+            base_url= os.getenv("AZURE_OPENAI_ENDPOINT"), 
+            api_key= os.getenv("AZURE_OPENAI_API_KEY")
+        ),
     tools=[get_verified_articles],
+    output_schema=DailyDigest,
     instructions=(
         "For each topic given, call get_verified_articles exactly once. "
-        "Then respond with ONLY a markdown table: Topic | Header | News | Source Link. "
-        "Use the tool's data exactly as returned — never alter, invent, or guess a URL. "
-        "If a topic's list is empty, add one row: Header='N/A', News='No verified "
-        "same-day articles found', Source Link='N/A'."
+        "For each article the tool returns, add one item copying header, news, and "
+        "source_link EXACTLY as given — character-for-character, no markdown, no added "
+        "links, no reformatting. If the tool returns an empty list for a topic, add one "
+        "item: header='N/A', news='No verified same-day articles found', source_link='N/A'."
     ),
-    markdown=True,
 )
 
 response = agent.run(f"Topics: {', '.join(TOPICS)}")
-print(response.content)   # this IS the answer — nothing written to disk
+digest: DailyDigest = response.content   # validated Pydantic object, not a string
+
+_CITATION_JUNK = re.compile(r'\s*\(\[[^\]]*\]\(https?://\S+?\)\)')
+
+def clean_text(s: str) -> str:
+    return _CITATION_JUNK.sub('', s).strip()
+
+rows = [
+    {
+        "topic": item.topic,
+        "header": clean_text(item.header),
+        "news": clean_text(item.news),
+        "source_link": item.source_link,
+    }
+    for item in digest.items
+]
+
+df = pd.DataFrame(rows)
+
+def print_clean_table(df: pd.DataFrame, width: int = 50):
+    wrapped = df.copy()
+    for col in wrapped.columns:
+        if col == "source_link":
+            continue  # keep URLs unbroken so terminals can auto-detect them as clickable
+        wrapped[col] = wrapped[col].apply(lambda x: "\n".join(textwrap.wrap(str(x), width)) or str(x))
+    print(tabulate(wrapped, headers="keys", tablefmt="grid", showindex=False))
+
+print_clean_table(df)
