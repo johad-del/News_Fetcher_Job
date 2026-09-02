@@ -1,6 +1,5 @@
+agno
 openai
-pandas
-openpyxl
 python-dotenv
 requests 
 beautifulsoup4
